@@ -1,0 +1,31 @@
+# Example config for dependabot-merger.sh.
+# Copy to dependabot-merger.conf and pass with --config, or point DBM_CONFIG at it.
+# This file is sourced as shell — set any knob as a variable.
+# Precedence: CLI flags > environment variables > this file > built-in defaults.
+
+# Which GitHub owners (users/orgs) to scan.
+OWNERS="anarkiwi c65sdn"
+
+# PR author to act on (rarely changed).
+# AUTHOR="app/dependabot"
+
+# Safety: 1 = preview only, 0 = actually merge.
+DRY_RUN=1
+
+# Pass tuning.
+MAX_PASSES=30
+SLEEP_SECONDS=45
+RED_STRIKES=3
+PR_LIMIT=100
+
+# auto|squash|rebase|merge  (auto picks the repo's allowed method)
+MERGE_METHOD=auto
+
+# Comment "@dependabot rebase" on PRs that are behind their base.
+REBASE_BEHIND=1
+
+# Risk knobs (1 = eligible to auto-merge).
+ALLOW_MAJOR_ACTIONS=1   # github_actions major bumps (CI) — usually safe
+ALLOW_MAJOR_DOCKER=0    # docker base-image major bumps (e.g. ubuntu 24 -> 26)
+ALLOW_MAJOR_DEPS=0      # library major bumps (potentially breaking)
+ALLOW_GROUPS=0          # grouped multi-update PRs (can hide majors)
