@@ -210,7 +210,7 @@ run() {
 
   WORK="$(mktemp -d)"   # global; cleaned by the EXIT trap set in main()
   declare -A STRIKES ABANDONED REBASED MERGE_CACHE
-  local TOTAL_MERGED=0 pass
+  local TOTAL_MERGED=0 pass WORKFLOW_SCOPE_FAIL=0
 
   local owner_args=(); local o; for o in $OWNERS; do owner_args+=(--owner "$o"); done
 
@@ -277,6 +277,7 @@ run() {
             gh pr comment --repo "$repo" "$num" --body "@dependabot rebase" >/dev/null 2>&1 && REBASED[$key]=1
           fi ;;
         RED|CONFLICT|BLOCKED|MERGE-FAIL)
+          [[ "$stat" == MERGE-FAIL && "$title" == *"workflow"*"scope"* ]] && WORKFLOW_SCOPE_FAIL=1
           STRIKES[$key]=$(( ${STRIKES[$key]:-0} + 1 ))
           if (( ${STRIKES[$key]} >= RED_STRIKES )); then ABANDONED[$key]=1; fi ;;
       esac
@@ -302,6 +303,14 @@ run() {
 
   echo; echo "================= SUMMARY ================="
   echo "Total merged: $TOTAL_MERGED  (dry-run=$DRY_RUN)"
+  if (( WORKFLOW_SCOPE_FAIL )); then
+    echo
+    echo "HINT: a merge failed because your gh token lacks the 'workflow' scope,"
+    echo "      which is required to merge PRs that touch .github/workflows/* files"
+    echo "      (e.g. Dependabot github_actions bumps). Add it with:"
+    echo "          gh auth refresh -h github.com -s workflow"
+    echo "      (org OAuth-app restrictions may also need an owner to approve it.)"
+  fi
   if [[ -s "$WORK/skips" ]]; then
     echo; echo "Skipped (need a human — not low-risk):"
     sort -u "$WORK/skips" | awk -F'\t' '{printf "  %-30s %-16s %s\n",$1$2,$3,$4}'
