@@ -139,6 +139,16 @@ JQ
 
 # ----------------------------- gh-backed helpers ----------------------------
 
+# is a repo archived? (archived repos are read-only — PRs can never be merged)
+# Cached across passes in REPO_ARCHIVED. Echoes "true"/"false".
+repo_is_archived() {
+  local repo="$1"
+  if [[ -n "${REPO_ARCHIVED[$repo]:-}" ]]; then echo "${REPO_ARCHIVED[$repo]}"; return; fi
+  local a; a=$(gh repo view "$repo" --json isArchived 2>/dev/null | jq -r '.isArchived // false')
+  [[ "$a" == true ]] || a=false
+  REPO_ARCHIVED[$repo]="$a"; echo "$a"
+}
+
 # resolve a repo's preferred merge method
 merge_method_for() {
   local repo="$1"
@@ -209,7 +219,7 @@ run() {
   command -v jq >/dev/null || { echo "jq not found" >&2; return 1; }
 
   WORK="$(mktemp -d)"   # global; cleaned by the EXIT trap set in main()
-  declare -A STRIKES ABANDONED REBASED MERGE_CACHE
+  declare -A STRIKES ABANDONED REBASED MERGE_CACHE REPO_ARCHIVED
   local TOTAL_MERGED=0 pass WORKFLOW_SCOPE_FAIL=0
 
   local owner_args=(); local o; for o in $OWNERS; do owner_args+=(--owner "$o"); done
@@ -231,6 +241,10 @@ run() {
     local repos repo num headref title eco verdict key
     mapfile -t repos < <(jq -r '.[].repository.nameWithOwner' "$all_json" | sort -u)
     for repo in "${repos[@]}"; do
+      if [[ "$(repo_is_archived "$repo")" == true ]]; then
+        printf '%s\t%s\t%s\t%s\n' "$repo" "" "archived" "repository is archived (read-only)" >>"$WORK/skips"
+        continue
+      fi
       local elig="$WORK/elig.${repo//\//__}.list"; : >"$elig"
       while IFS=$'\t' read -r num headref title; do
         key="$repo#$num"; [[ -n "${ABANDONED[$key]:-}" ]] && continue
