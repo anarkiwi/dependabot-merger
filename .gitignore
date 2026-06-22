@@ -1,2 +1,5 @@
 # Local, user-specific config (copy from dependabot-merger.conf.example)
 dependabot-merger.conf
+
+# NFS leftover temp files (deleted-but-open files on NFS mounts)
+.nfs*
