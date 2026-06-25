@@ -34,7 +34,8 @@ run stops when nothing mergeable remains.
 | Same-major Docker base-image bumps (e.g. `3.23 → 3.24`) | ✅ merge |
 | Major library bumps | ⏭️ skip (`ALLOW_MAJOR_DEPS=1` to enable) |
 | Major Docker bumps (e.g. `ubuntu 24 → 26`) | ⏭️ skip (`ALLOW_MAJOR_DOCKER=1`) |
-| Grouped multi-update PRs (can hide majors) | ⏭️ skip (`ALLOW_GROUPS=1`) |
+| Grouped PRs where every member is minor/patch | ✅ merge |
+| Grouped PRs containing a major bump | ⏭️ skip (`ALLOW_GROUPS=1` to force) |
 
 A PR is only merged if it is also mergeable and its required checks are green.
 
@@ -78,7 +79,7 @@ built-in defaults**. Every flag has an equivalent env var.
 | `ALLOW_MAJOR_ACTIONS` | `1` | merge Actions major bumps |
 | `ALLOW_MAJOR_DOCKER` | `0` | merge Docker major bumps |
 | `ALLOW_MAJOR_DEPS` | `0` | merge library major bumps |
-| `ALLOW_GROUPS` | `0` | merge grouped PRs |
+| `ALLOW_GROUPS` | `0` | `1` = merge any grouped PR (incl. major bumps); all-minor groups merge regardless |
 
 Copy `dependabot-merger.conf.example` to `dependabot-merger.conf`, edit, and
 pass `--config dependabot-merger.conf` (or set `DBM_CONFIG`).

@@ -8,7 +8,8 @@
 
 # SC1091: the sourced path is computed at runtime; SC2034: knob vars set here
 # are consumed by classify() in the sourced script, which shellcheck can't see.
-# shellcheck disable=SC1091,SC2034
+# SC2016: literal backticks in the sample Dependabot bodies below are intended.
+# shellcheck disable=SC1091,SC2034,SC2016
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,8 +44,27 @@ assert_eq "docker same-major -> low"     low "$(classify docker 'Bump alpine fro
 assert_eq "docker major -> skip"         skip:docker-major "$(classify docker 'Bump ubuntu from 24.04 to 26.04')"
 assert_eq "pip patch -> low"             low "$(classify pip 'Bump numpy from 2.4.4 to 2.4.6')"
 assert_eq "pip major -> skip"            skip:dep-major "$(classify pip 'Bump os-ken from 2.11.2 to 4.2.1')"
-assert_eq "grouped -> skip"              skip:grouped-update "$(classify pip 'Bump the pip group across 3 directories with 2 updates')"
+assert_eq "grouped (no body) -> skip"    skip:grouped-update "$(classify pip 'Bump the pip group across 3 directories with 2 updates')"
 assert_eq "actions group still low"      low "$(classify github_actions 'deps(actions): bump the actions group with 2 updates')"
+
+GROUP_TITLE='Bump the pip group across 3 directories with 2 updates'
+GROUP_MINOR_BODY='Bumps the pip group with 2 updates: requests and urllib3.
+
+Updates `requests` from 2.28.0 to 2.31.0
+- changelog
+
+Updates `urllib3` from 1.26.0 to 1.26.18
+- changelog'
+GROUP_MAJOR_BODY='Bumps the pip group with 2 updates: requests and urllib3.
+
+Updates `requests` from 2.28.0 to 2.31.0
+
+Updates `urllib3` from 1.26.0 to 2.0.0'
+assert_eq "grouped all-minor body -> low"  low "$(classify pip "$GROUP_TITLE" "$GROUP_MINOR_BODY")"
+assert_eq "grouped major in body -> skip"  skip:grouped-update "$(classify pip "$GROUP_TITLE" "$GROUP_MAJOR_BODY")"
+assert_eq "group_all_minor: minors -> low" low "$(group_all_minor "$GROUP_MINOR_BODY")"
+assert_eq "group_all_minor: major -> skip" skip:grouped-update "$(group_all_minor "$GROUP_MAJOR_BODY")"
+assert_eq "group_all_minor: empty -> skip" skip:grouped-update "$(group_all_minor '')"
 assert_eq "requirement same major -> low" low "$(classify pip 'Update pytest requirement from <10,>=9.0.3 to >=9.1.0,<10')"
 assert_eq "requirement major -> skip"    skip:dep-major "$(classify pip 'Update packaging requirement from >=24.0 to >=26.2')"
 

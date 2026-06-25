@@ -52,7 +52,9 @@ set_defaults() {
   ALLOW_MAJOR_ACTIONS=1           # github_actions major bumps (CI) — usually safe
   ALLOW_MAJOR_DOCKER=0            # docker base-image major bumps (ubuntu 24->26)
   ALLOW_MAJOR_DEPS=0              # library major bumps (breaking) — off by default
-  ALLOW_GROUPS=0                  # grouped multi-update PRs (can hide majors)
+  ALLOW_GROUPS=0                  # 1 = allow ALL grouped PRs (incl. ones with a
+                                  # major bump). Off by default, but all-minor
+                                  # groups are still treated as low-risk.
 }
 
 usage() {
@@ -92,10 +94,34 @@ extract_major() {
   grep -oE '^[0-9]+' <<<"$v"
 }
 
-# classify <ecosystem> <title>  -> echoes "low" or "skip:<reason>"
-# Reads the ALLOW_* knobs from the environment.
+# Decide a grouped-update PR from its body: echo "low" if EVERY member update
+# stays within the same major version (minor/patch only), else
+# "skip:grouped-update". Dependabot lists each member as a line like
+#   Updates `foo` from 1.2.0 to 1.3.0
+#   Bumps `actions/checkout` from 3 to 4
+# A body with no recognisable member lines is treated as skip (unknown = unsafe).
+group_all_minor() {
+  local body="$1" x y mx my n=0
+  # SC2016: the backticks below are literal text in Dependabot PR bodies, not
+  # command substitution.
+  # shellcheck disable=SC2016
+  while IFS=$'\t' read -r x y; do
+    [ -z "$x" ] && continue
+    n=$((n+1))
+    mx=$(extract_major "$x"); my=$(extract_major "$y")
+    if [[ -n "$mx" && -n "$my" && "$mx" != "$my" ]]; then
+      echo "skip:grouped-update"; return
+    fi
+  done < <(grep -oiE '(updates|bumps) `[^`]+` from [^ ]+ to [^ ]+' <<<"$body" \
+            | sed -E 's/.* [Ff]rom (.+) [Tt]o (.+)$/\1\t\2/')
+  if (( n == 0 )); then echo "skip:grouped-update"; else echo low; fi
+}
+
+# classify <ecosystem> <title> [body]  -> echoes "low" or "skip:<reason>"
+# Reads the ALLOW_* knobs from the environment. For grouped PRs the optional
+# body is inspected so an all-minor group is treated as low-risk.
 classify() {
-  local eco="$1" title="$2" x y mx my major=0 group=0
+  local eco="$1" title="$2" body="${3:-}" x y mx my major=0 group=0
   shopt -s nocasematch
   [[ "$title" =~ (the\ .*\ group|group\ with|group\ across) ]] && group=1
   if [[ "$title" =~ from\ (.+)\ to\ (.+)$ ]]; then
@@ -109,7 +135,9 @@ classify() {
     if [[ "$major" == 1 && "$ALLOW_MAJOR_ACTIONS" != 1 ]]; then echo "skip:actions-major"; else echo low; fi
     return
   fi
-  if [[ "$group" == 1 && "$ALLOW_GROUPS" != 1 ]]; then echo "skip:grouped-update"; return; fi
+  # Grouped PRs: allowed wholesale via ALLOW_GROUPS, otherwise only when every
+  # member update in the body is a same-major (minor/patch) bump.
+  if [[ "$group" == 1 && "$ALLOW_GROUPS" != 1 ]]; then group_all_minor "$body"; return; fi
   case "$eco" in
     docker)
       if [[ "$major" == 1 && "$ALLOW_MAJOR_DOCKER" != 1 ]]; then echo "skip:docker-major"; else echo low; fi ;;
@@ -245,11 +273,18 @@ run() {
         printf '%s\t%s\t%s\t%s\n' "$repo" "" "archived" "repository is archived (read-only)" >>"$WORK/skips"
         continue
       fi
-      local elig="$WORK/elig.${repo//\//__}.list"; : >"$elig"
+      local elig="$WORK/elig.${repo//\//__}.list"; local body
+      : >"$elig"
       while IFS=$'\t' read -r num headref title; do
         key="$repo#$num"; [[ -n "${ABANDONED[$key]:-}" ]] && continue
         eco=$(cut -d/ -f2 <<<"$headref")
-        verdict=$(classify "$eco" "$title")
+        # Grouped non-actions PRs need the body to tell all-minor groups
+        # (mergeable) from groups that hide a major bump (skip).
+        body=""
+        if [[ "$ALLOW_GROUPS" != 1 && "$eco" != github_actions && "${title,,}" == *group* ]]; then
+          body=$(gh pr view "$num" --repo "$repo" --json body -q .body 2>/dev/null)
+        fi
+        verdict=$(classify "$eco" "$title" "$body")
         if [[ "$verdict" == low ]]; then
           printf '%s\t%s\t%s\n' "$num" "$eco" "$title" >>"$elig"
         else
