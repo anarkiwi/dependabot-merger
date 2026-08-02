@@ -39,11 +39,33 @@ run stops when nothing mergeable remains.
 
 A PR is only merged if it is also mergeable and its required checks are green.
 
+### Workflow PRs (SSH fallback)
+
+The GitHub merge API refuses any PR touching `.github/workflows/*` unless the
+token carries the `workflow` scope — which blocks most Dependabot
+`github_actions` bumps, and cannot always be granted (org OAuth-app policy).
+
+SSH keys carry no OAuth scopes, so when the API refuses, the merge is redone as
+a plain git push over SSH: fetch the base and `refs/pull/<n>/head` into a
+reusable blobless checkout, fast-forward (or build a merge commit if base has
+moved on), push to the base branch, delete the head branch. The PR head SHA
+lands in base, so GitHub marks the PR **merged**, not just closed. Such merges
+are reported as `MERGED-SSH`.
+
+Because the SHA must survive, this path always fast-forwards or merges;
+`MERGE_METHOD` (squash/rebase) does not apply to it. Branch protection still
+applies — a protected base rejects the push and the PR is left alone.
+
+Needs `git` and an SSH key registered with GitHub (`ssh -T git@github.com`).
+Disable with `--no-ssh-fallback`; use `--ssh-always` to skip the API entirely
+when the token is known to lack the scope.
+
 ## Requirements
 
 - [`gh`](https://cli.github.com/) (authenticated: `gh auth login`)
 - `jq`
 - `bash` 4+
+- `git` + an SSH key registered with GitHub (for the workflow-PR fallback)
 
 ## Usage
 
@@ -76,6 +98,8 @@ built-in defaults**. Every flag has an equivalent env var.
 | `MERGE_METHOD` | `auto` | `auto`/`squash`/`rebase`/`merge` |
 | `PR_LIMIT` | `100` | max PRs fetched per repo |
 | `REBASE_BEHIND` | `1` | comment `@dependabot rebase` on behind PRs |
+| `SSH_FALLBACK` | `1` | `0` off, `1` merge over SSH when the API refuses for lack of `workflow` scope, `always` never use the API |
+| `SSH_HOST` | `github.com` | SSH target (`git@$SSH_HOST:owner/repo.git`) |
 | `ALLOW_MAJOR_ACTIONS` | `1` | merge Actions major bumps |
 | `ALLOW_MAJOR_DOCKER` | `0` | merge Docker major bumps |
 | `ALLOW_MAJOR_DEPS` | `0` | merge library major bumps |

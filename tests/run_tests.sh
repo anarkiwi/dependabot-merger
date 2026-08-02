@@ -88,6 +88,60 @@ assert_eq "in-progress -> pending" pending "$(echo '[{"number":1,"headRefName":"
 assert_eq "status ctx error -> red" red    "$(echo '[{"number":1,"headRefName":"x","createdAt":"t","title":"t","statusCheckRollup":[{"state":"ERROR","context":"ci"}]}]' | ci_verdict)"
 assert_eq "skipped only -> green"  green   "$(echo '[{"number":1,"headRefName":"x","createdAt":"t","title":"t","statusCheckRollup":[{"status":"COMPLETED","conclusion":"SKIPPED"}]}]' | ci_verdict)"
 
+echo "== is_workflow_scope_err =="
+GH_SCOPE_ERR='failed to merge pull request: refusing to allow an OAuth App to create or update workflow `.github/workflows/ci.yml` without `workflow` scope'
+is_workflow_scope_err "$GH_SCOPE_ERR"; assert_eq "gh OAuth refusal"        0 "$?"
+is_workflow_scope_err 'GraphQL: refusing to allow a Personal Access Token to create or update workflow `.github/workflows/x.yml` without `workflow` scope (mergePullRequest)'
+assert_eq "gh PAT refusal"                                                 0 "$?"
+is_workflow_scope_err 'Pull request is not mergeable: the base branch was modified'; assert_eq "unrelated merge failure" 1 "$?"
+is_workflow_scope_err 'GraphQL: Resource not accessible by integration';   assert_eq "permission failure" 1 "$?"
+
+echo "== git_land_pr (local repos) =="
+# Exercises the real fallback mechanics — fast-forward land, merge-commit land
+# when base has moved on, head-branch deletion — over a file:// remote.
+GITDIR=$(mktemp -d); trap 'rm -rf "$GITDIR"' EXIT
+git_q() { git -C "$1" -c user.name=t -c user.email=t@e -c init.defaultBranch=main "${@:2}" >/dev/null 2>&1; }
+
+# origin: main with one commit, plus a "PR" branch on top of it.
+mkdir -p "$GITDIR/work"
+git -C "$GITDIR/work" init -q -b main >/dev/null 2>&1
+echo base >"$GITDIR/work/f"; git_q "$GITDIR/work" add f; git_q "$GITDIR/work" commit -m base
+git_q "$GITDIR/work" checkout -b pr
+echo bumped >"$GITDIR/work/f"; git_q "$GITDIR/work" commit -am bump
+git init -q --bare "$GITDIR/origin.git" >/dev/null 2>&1
+git -C "$GITDIR/origin.git" config uploadpack.allowFilter true
+git_q "$GITDIR/work" remote add origin "$GITDIR/origin.git"
+git_q "$GITDIR/work" push origin main pr
+
+land_err=$(git_land_pr "$GITDIR/c1" "$GITDIR/origin.git" main refs/heads/pr pr "merge pr" 2>&1)
+assert_eq "ff land succeeds"      0 "$?"
+assert_eq "ff land is silent"     "" "$land_err"
+assert_eq "base has the bump"     bumped "$(git -C "$GITDIR/origin.git" show main:f)"
+assert_eq "ff land is linear"     0 "$(git -C "$GITDIR/origin.git" rev-list --count --merges main)"
+assert_eq "head branch deleted"   "" "$(git -C "$GITDIR/origin.git" for-each-ref --format='%(refname)' refs/heads/pr)"
+
+# Second PR branched off the old base, with origin/main since moved on: needs a
+# merge commit, and the reused checkout dir exercises the cached-clone path.
+git_q "$GITDIR/work" checkout -b pr2 main
+echo other >"$GITDIR/work/g"; git_q "$GITDIR/work" add g; git_q "$GITDIR/work" commit -m other
+git_q "$GITDIR/work" push origin pr2
+git_land_pr "$GITDIR/c1" "$GITDIR/origin.git" main refs/heads/pr2 pr2 "merge pr2" >/dev/null 2>&1
+assert_eq "diverged land succeeds" 0 "$?"
+assert_eq "merge commit created"   1 "$(git -C "$GITDIR/origin.git" rev-list --count --merges main)"
+assert_eq "bump survives merge"    bumped "$(git -C "$GITDIR/origin.git" show main:f)"
+assert_eq "pr2 file landed"        other  "$(git -C "$GITDIR/origin.git" show main:g)"
+
+# A conflicting PR must fail cleanly rather than push anything.
+git_q "$GITDIR/work" checkout -b pr3 main
+echo conflicting >"$GITDIR/work/f"; git_q "$GITDIR/work" commit -am conflict
+git_q "$GITDIR/work" push origin pr3
+BEFORE=$(git -C "$GITDIR/origin.git" rev-parse main)
+land_err=$(git_land_pr "$GITDIR/c1" "$GITDIR/origin.git" main refs/heads/pr3 pr3 "merge pr3" 2>&1)
+assert_eq "conflicting land fails"  1 "$?"
+assert_eq "conflict is reported"    1 "$([[ "$land_err" == *"cannot merge onto main"* ]] && echo 1 || echo 0)"
+assert_eq "base untouched"          "$BEFORE" "$(git -C "$GITDIR/origin.git" rev-parse main)"
+assert_eq "conflicting head kept"   1 "$(git -C "$GITDIR/origin.git" for-each-ref --format=x refs/heads/pr3 | wc -l)"
+
 echo
 echo "==================================="
 echo "PASS: $PASS   FAIL: $FAIL"

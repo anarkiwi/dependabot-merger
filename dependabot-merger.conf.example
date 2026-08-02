@@ -24,6 +24,11 @@ MERGE_METHOD=auto
 # Comment "@dependabot rebase" on PRs that are behind their base.
 REBASE_BEHIND=1
 
+# Merge over SSH when the API refuses a PR touching .github/workflows/* because
+# the token lacks the 'workflow' scope. 0 = off, 1 = on refusal, always = only ssh.
+SSH_FALLBACK=1
+SSH_HOST=github.com
+
 # Risk knobs (1 = eligible to auto-merge).
 ALLOW_MAJOR_ACTIONS=1   # github_actions major bumps (CI) — usually safe
 ALLOW_MAJOR_DOCKER=0    # docker base-image major bumps (e.g. ubuntu 24 -> 26)
