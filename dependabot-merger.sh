@@ -17,10 +17,15 @@
 # SAFE BY DEFAULT: dry-run. It prints what it WOULD merge and changes nothing.
 # Pass --execute (or DRY_RUN=0) to actually merge.
 #
+# SSH FALLBACK: the GitHub API refuses to merge a PR touching
+# .github/workflows/* unless the token carries the 'workflow' scope — which
+# blocks most Dependabot github_actions bumps. SSH keys carry no OAuth scopes,
+# so when the API refuses, the merge is redone as a direct git push over SSH.
+#
 # Configuration precedence (highest wins):
 #   CLI flags  >  environment variables  >  config file  >  built-in defaults
 #
-# Requires: gh (authenticated), jq, bash 4+.
+# Requires: gh (authenticated), jq, bash 4+; git + an SSH key for the fallback.
 #
 # Usage:
 #   ./dependabot-merger.sh                       # dry-run, default owners
@@ -34,7 +39,7 @@
 # The "knobs" this script understands (used for env snapshotting & defaults).
 DBM_KNOBS=(OWNERS AUTHOR DRY_RUN MAX_PASSES SLEEP_SECONDS RED_STRIKES
   MERGE_METHOD REBASE_BEHIND PR_LIMIT ALLOW_MAJOR_ACTIONS ALLOW_MAJOR_DOCKER
-  ALLOW_MAJOR_DEPS ALLOW_GROUPS)
+  ALLOW_MAJOR_DEPS ALLOW_GROUPS SSH_FALLBACK SSH_HOST)
 
 # Built-in defaults. Called by main() and by the test suite.
 set_defaults() {
@@ -48,6 +53,10 @@ set_defaults() {
   REBASE_BEHIND=1                 # comment "@dependabot rebase" on BEHIND PRs
   PR_LIMIT=100                    # max PRs fetched per repo
 
+  # SSH push fallback for merges the API refuses for lack of 'workflow' scope.
+  SSH_FALLBACK=1                  # 0 = off, 1 = on API refusal, always = never use the API
+  SSH_HOST=github.com             # ssh target (git@$SSH_HOST:owner/repo.git)
+
   # Risk knobs (1 = treat as low-risk / eligible to auto-merge).
   ALLOW_MAJOR_ACTIONS=1           # github_actions major bumps (CI) — usually safe
   ALLOW_MAJOR_DOCKER=0            # docker base-image major bumps (ubuntu 24->26)
@@ -58,7 +67,7 @@ set_defaults() {
 }
 
 usage() {
-  sed -n '2,46p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   cat <<'EOF'
 
 Flags:
@@ -77,6 +86,9 @@ Flags:
   --[no-]allow-major-docker  toggle docker major bumps        [ALLOW_MAJOR_DOCKER]
   --[no-]allow-major-deps    toggle library major bumps       [ALLOW_MAJOR_DEPS]
   --[no-]allow-groups        toggle grouped PRs               [ALLOW_GROUPS]
+  --[no-]ssh-fallback        toggle the SSH push fallback     [SSH_FALLBACK]
+  --ssh-always               merge over SSH, never the API    [SSH_FALLBACK=always]
+  --ssh-host HOST            ssh target host                  [SSH_HOST]
   -h, --help                 this help
 
 Every flag has an equivalent environment variable (shown in [brackets]).
@@ -165,6 +177,91 @@ def ci(r):
 JQ
 }
 
+# Did a merge fail because the token lacks the 'workflow' scope? gh reports
+# "refusing to allow an OAuth App / a Personal Access Token to create or update
+# workflow `.github/workflows/x.yml` without `workflow` scope".
+is_workflow_scope_err() {
+  local s="${1,,}"
+  [[ "$s" == *workflow* && ( "$s" == *scope* || "$s" == *"refusing to allow"* ) ]]
+}
+
+# ----------------------------- ssh merge path -------------------------------
+
+# Can we authenticate to $SSH_HOST over ssh? GitHub exits 1 on a successful -T
+# probe ("shell access" denial), so match the greeting, not the exit status.
+ssh_auth_ok() {
+  command -v git >/dev/null || return 1
+  local out
+  out=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+        -T "git@${SSH_HOST}" 2>&1)
+  [[ "$out" == *"successfully authenticated"* || "$out" == *"Hi "* ]]
+}
+
+# Land a PR head onto its base branch with plain git, then delete the head
+# branch. Fast-forwards when the head already sits on the base tip (the normal
+# case for a CLEAN Dependabot PR), otherwise builds a merge commit. Either way
+# the head SHA becomes reachable from base, so GitHub marks the PR merged
+# rather than merely closed — which is why MERGE_METHOD is not honoured here.
+# $dir is a reusable blobless checkout; a rejected push means base advanced
+# mid-flight, so refetch and retry once.
+#   $1 dir  $2 remote  $3 base branch  $4 head refspec  $5 head branch  $6 merge msg
+#   -> 0 on success; diagnostics on stderr
+git_land_pr() {
+  local dir="$1" remote="$2" base="$3" headref="$4" headbranch="$5" msg="$6" src out attempt
+  if [[ ! -d "$dir/.git" ]]; then
+    if ! out=$(git init -q "$dir" 2>&1) || ! out=$(git -C "$dir" remote add origin "$remote" 2>&1); then
+      echo "git init failed: $out" >&2; rm -rf "$dir"; return 1
+    fi
+  fi
+
+  local fetch=(git -C "$dir" fetch -q --no-tags --force)
+  local refs=(origin "+refs/heads/$base:refs/dbm/base" "+$headref:refs/dbm/head")
+  for attempt in 1 2; do
+    # Blobless first (an ff-only land needs no file contents at all), falling
+    # back to a full fetch for servers that reject filters.
+    if ! out=$("${fetch[@]}" --filter=blob:none "${refs[@]}" 2>&1) &&
+       ! out=$("${fetch[@]}" "${refs[@]}" 2>&1); then
+      echo "fetch failed: $out" >&2; return 1
+    fi
+    if git -C "$dir" merge-base --is-ancestor refs/dbm/base refs/dbm/head 2>/dev/null; then
+      src=refs/dbm/head
+    else
+      if ! out=$(git -C "$dir" checkout -q --force -B dbm-merge refs/dbm/base 2>&1) ||
+         ! out=$(git -C "$dir" -c "user.name=${DBM_GIT_NAME:-dependabot-merger}" \
+             -c "user.email=${DBM_GIT_EMAIL:-dependabot-merger@users.noreply.github.com}" \
+             merge -q --no-ff -m "$msg" refs/dbm/head 2>&1); then
+        git -C "$dir" merge --abort 2>/dev/null
+        echo "cannot merge onto $base: $out" >&2; return 1
+      fi
+      src=dbm-merge
+    fi
+    out=$(git -C "$dir" push origin "$src:refs/heads/$base" 2>&1) && break
+    if (( attempt == 2 )); then echo "push failed: $out" >&2; return 1; fi
+  done
+
+  [[ -n "$headbranch" ]] && git -C "$dir" push -q origin ":refs/heads/$headbranch" 2>/dev/null
+  return 0
+}
+
+# The fallback's state, for the run header.
+ssh_fallback_status() {
+  if   [[ "$SSH_FALLBACK" == 0 ]]; then echo off
+  elif [[ "$SSH_OK" == 1 ]];       then echo "$SSH_FALLBACK (git@${SSH_HOST})"
+  else echo "unavailable (no ssh auth to git@${SSH_HOST})"; fi
+}
+
+# Merge a PR by pushing to the base branch over SSH, bypassing the OAuth scope
+# check the REST/GraphQL merge endpoints apply to workflow files.
+#   $1 repo  $2 pr number  ->  0 on success; diagnostics on stderr
+merge_via_ssh() {
+  local repo="$1" num="$2" base head
+  IFS=$'\t' read -r base head < <(gh pr view "$num" --repo "$repo" \
+      --json baseRefName,headRefName -q '[.baseRefName,.headRefName]|@tsv' 2>/dev/null)
+  [[ -z "$base" ]] && { echo "ssh: cannot resolve base branch of #$num" >&2; return 1; }
+  git_land_pr "$WORK/ssh/${repo//\//__}" "git@${SSH_HOST}:${repo}.git" \
+      "$base" "refs/pull/$num/head" "$head" "Merge pull request #$num from $head"
+}
+
 # ----------------------------- gh-backed helpers ----------------------------
 
 # is a repo archived? (archived repos are read-only — PRs can never be merged)
@@ -189,6 +286,28 @@ merge_method_for() {
     else m=merge; fi
   fi
   MERGE_CACHE[$repo]="$m"; echo "$m"
+}
+
+# Merge one PR via the API, falling back to an SSH push when the API refuses
+# for want of the 'workflow' scope. Appends a result line to $5; 0 if merged.
+#   $1 repo  $2 num  $3 method  $4 title  $5 outfile
+merge_pr() {
+  local repo="$1" num="$2" method="$3" title="$4" outfile="$5" err
+  if [[ "$SSH_FALLBACK" != always ]]; then
+    if err=$(gh pr merge --repo "$repo" "$num" "--$method" --delete-branch 2>&1 >/dev/null); then
+      echo -e "MERGED\t$repo\t$num\t$title" >>"$outfile"; return 0
+    fi
+    if [[ "$SSH_FALLBACK" == 0 ]] || ! is_workflow_scope_err "$err"; then
+      echo -e "MERGE-FAIL\t$repo\t$num\t$title ($(tr '\n' ' ' <<<"$err"))" >>"$outfile"; return 1
+    fi
+    if [[ "${SSH_OK:-0}" != 1 ]]; then
+      echo -e "MERGE-FAIL\t$repo\t$num\t$title (workflow scope refused; no ssh fallback)" >>"$outfile"; return 1
+    fi
+  fi
+  if err=$(merge_via_ssh "$repo" "$num" 2>&1 >/dev/null); then
+    echo -e "MERGED-SSH\t$repo\t$num\t$title" >>"$outfile"; return 0
+  fi
+  echo -e "MERGE-FAIL\t$repo\t$num\t$title ($(tr '\n' ' ' <<<"$err"))" >>"$outfile"; return 1
 }
 
 # Process one repo: merge at most one ready PR (oldest first). Writes result
@@ -229,12 +348,9 @@ process_repo() {
     if [[ "$state" =~ ^(CLEAN|UNSTABLE|HAS_HOOKS)$ && ( "$ci" == green || "$ci" == none ) ]]; then
       if [[ "$DRY_RUN" == 1 ]]; then
         echo -e "WOULD-MERGE\t$repo\t$num\t$title" >>"$outfile"; merged_here=1
-      elif gh pr merge --repo "$repo" "$num" "--$method" --delete-branch >/dev/null 2>"$outfile.err"; then
-        echo -e "MERGED\t$repo\t$num\t$title" >>"$outfile"; merged_here=1
-      else
-        echo -e "MERGE-FAIL\t$repo\t$num\t$title ($(tr '\n' ' ' <"$outfile.err"))" >>"$outfile"
+      elif merge_pr "$repo" "$num" "$method" "$title" "$outfile"; then
+        merged_here=1
       fi
-      rm -f "$outfile.err"
       continue
     fi
     echo -e "PENDING\t$repo\t$num\t$title" >>"$outfile"
@@ -250,10 +366,23 @@ run() {
   declare -A STRIKES ABANDONED REBASED MERGE_CACHE REPO_ARCHIVED
   local TOTAL_MERGED=0 pass WORKFLOW_SCOPE_FAIL=0
 
+  # SSH fallback readiness + identity for any merge commit it has to make.
+  # Set before the parallel workers fork so they inherit it.
+  SSH_OK=0
+  if [[ "$SSH_FALLBACK" != 0 ]] && ssh_auth_ok; then SSH_OK=1; fi
+  if [[ "$SSH_OK" != 1 && "$SSH_FALLBACK" == always ]]; then
+    echo "no ssh access to git@${SSH_HOST}; --ssh-always is not usable" >&2; return 1
+  fi
+  DBM_GIT_NAME=$(git config --get user.name 2>/dev/null || true)
+  DBM_GIT_EMAIL=$(git config --get user.email 2>/dev/null || true)
+  : "${DBM_GIT_NAME:=dependabot-merger}"
+  : "${DBM_GIT_EMAIL:=dependabot-merger@users.noreply.github.com}"
+
   local owner_args=(); local o; for o in $OWNERS; do owner_args+=(--owner "$o"); done
 
   echo "== dependabot-merger =="
   echo "owners: $OWNERS | author: $AUTHOR | dry-run: $DRY_RUN | red-strikes: $RED_STRIKES | sleep: ${SLEEP_SECONDS}s"
+  echo "ssh-fallback: $(ssh_fallback_status)"
   echo
 
   for ((pass=1; pass<=MAX_PASSES; pass++)); do
@@ -317,7 +446,7 @@ run() {
       [ -z "$stat" ] && continue
       key="$repo#$num"
       case "$stat" in
-        MERGED)       merged_this=$((merged_this+1)); TOTAL_MERGED=$((TOTAL_MERGED+1)); STRIKES[$key]=0 ;;
+        MERGED|MERGED-SSH) merged_this=$((merged_this+1)); TOTAL_MERGED=$((TOTAL_MERGED+1)); STRIKES[$key]=0 ;;
         WOULD-MERGE)  merged_this=$((merged_this+1)); STRIKES[$key]=0 ;;
         PENDING|WAIT) pending_this=$((pending_this+1)); STRIKES[$key]=0 ;;
         BEHIND)
@@ -326,7 +455,7 @@ run() {
             gh pr comment --repo "$repo" "$num" --body "@dependabot rebase" >/dev/null 2>&1 && REBASED[$key]=1
           fi ;;
         RED|CONFLICT|BLOCKED|MERGE-FAIL)
-          [[ "$stat" == MERGE-FAIL && "$title" == *"workflow"*"scope"* ]] && WORKFLOW_SCOPE_FAIL=1
+          [[ "$stat" == MERGE-FAIL ]] && is_workflow_scope_err "$title" && WORKFLOW_SCOPE_FAIL=1
           STRIKES[$key]=$(( ${STRIKES[$key]:-0} + 1 ))
           if (( ${STRIKES[$key]} >= RED_STRIKES )); then ABANDONED[$key]=1; fi ;;
       esac
@@ -355,8 +484,10 @@ run() {
   if (( WORKFLOW_SCOPE_FAIL )); then
     echo
     echo "HINT: a merge failed because your gh token lacks the 'workflow' scope,"
-    echo "      which is required to merge PRs that touch .github/workflows/* files"
-    echo "      (e.g. Dependabot github_actions bumps). Add it with:"
+    echo "      required for PRs touching .github/workflows/* (e.g. Dependabot"
+    echo "      github_actions bumps). The SSH push fallback handles these, but it"
+    echo "      could not run here. Either enable it (--ssh-fallback, needs an SSH"
+    echo "      key registered for git@${SSH_HOST}) or widen the token:"
     echo "          gh auth refresh -h github.com -s workflow"
     echo "      (org OAuth-app restrictions may also need an owner to approve it.)"
   fi
@@ -419,6 +550,10 @@ main() {
       --no-allow-major-deps) ALLOW_MAJOR_DEPS=0 ;;
       --allow-groups) ALLOW_GROUPS=1 ;;
       --no-allow-groups) ALLOW_GROUPS=0 ;;
+      --ssh-fallback) SSH_FALLBACK=1 ;;
+      --no-ssh-fallback) SSH_FALLBACK=0 ;;
+      --ssh-always) SSH_FALLBACK=always ;;
+      --ssh-host) SSH_HOST="$2"; shift ;;
       -h|--help) usage; return 0 ;;
       *) echo "unknown arg: $1 (try --help)" >&2; return 2 ;;
     esac
